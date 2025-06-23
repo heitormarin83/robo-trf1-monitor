@@ -5,9 +5,13 @@ from datetime import datetime
 import json
 import os
 import yagmail
+import time
 
-# URL do processo
-url = "https://pje2g.trf1.jus.br/consultapublica/ConsultaPublica/DetalheProcessoConsultaPublica/listView.seam?ca=f6a55fbc9faaab3a0728ab495301f39d90cb6c0728456e86"
+# Configurações
+CPF_BUSCA = "30696525810"
+PROCESSO_NUMERO = "1002946-59.2025.4.01.9999"
+PROCESSO_TEXTO = "ApCiv 1002946-59.2025.4.01.9999 - Ambiental"
+URL_CONSULTA = "https://pje2g.trf1.jus.br/consultapublica/ConsultaPublica/listView.seam"
 
 # Caminho para o arquivo de movimentos anteriores
 previous_movs_file = "movimentos_trf1_previous.json"
@@ -16,6 +20,267 @@ previous_movs_file = "movimentos_trf1_previous.json"
 EMAIL_USER = os.getenv("EMAIL_USER", "heitor.a.marin@gmail.com")
 EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "vueywlqyqhsozzqr")
 EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT", "heitor.a.marin@gmail.com")
+
+def create_session():
+    """
+    Cria uma sessão HTTP com headers apropriados
+    """
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    })
+    return session
+
+def buscar_processo_validado(session, cpf):
+    """
+    Busca processo usando exatamente o método validado manualmente
+    """
+    try:
+        print(f"Acessando página de consulta: {URL_CONSULTA}")
+        
+        # Primeira requisição para obter a página inicial
+        response = session.get(URL_CONSULTA)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Procurar pelo formulário de busca
+        form = soup.find('form')
+        if not form:
+            print("Erro: Formulário de busca não encontrado")
+            return None
+        
+        # Extrair action do formulário
+        form_action = form.get('action', '')
+        if form_action.startswith('/'):
+            form_url = f"https://pje2g.trf1.jus.br{form_action}"
+        else:
+            form_url = f"https://pje2g.trf1.jus.br/consultapublica/ConsultaPublica/{form_action}"
+        
+        print(f"URL do formulário: {form_url}")
+        
+        # Extrair TODOS os campos hidden do formulário
+        form_data = {}
+        hidden_inputs = soup.find_all('input', type='hidden')
+        for hidden in hidden_inputs:
+            name = hidden.get('name')
+            value = hidden.get('value', '')
+            if name:
+                form_data[name] = value
+        
+        # Extrair outros campos necessários
+        all_inputs = soup.find_all('input')
+        for input_elem in all_inputs:
+            name = input_elem.get('name')
+            value = input_elem.get('value', '')
+            input_type = input_elem.get('type', 'text')
+            
+            if name and input_type not in ['hidden', 'submit'] and value:
+                form_data[name] = value
+        
+        # Campo CPF específico - baseado na validação manual
+        # Na validação, descobrimos que o campo correto tem o nome relacionado a "tipoMascaraDocumento"
+        cpf_field_candidates = [
+            'tipoMascaraDocumento',
+            'fPP:Decoration:numeroOAB',
+            'fPP:numeroOAB',
+            'numeroOAB'
+        ]
+        
+        cpf_field_name = None
+        for candidate in cpf_field_candidates:
+            if any(inp.get('name') == candidate for inp in all_inputs):
+                cpf_field_name = candidate
+                print(f"Campo CPF encontrado: {cpf_field_name}")
+                break
+        
+        # Se não encontrou pelos nomes conhecidos, procurar por padrão
+        if not cpf_field_name:
+            for input_elem in all_inputs:
+                name = input_elem.get('name', '')
+                input_type = input_elem.get('type', 'text')
+                if input_type == 'text' and any(term in name.lower() for term in ['cpf', 'documento', 'oab']):
+                    cpf_field_name = name
+                    print(f"Campo CPF encontrado por padrão: {cpf_field_name}")
+                    break
+        
+        if not cpf_field_name:
+            print("Erro: Campo CPF não encontrado")
+            return None
+        
+        # Adicionar CPF aos dados do formulário
+        form_data[cpf_field_name] = cpf
+        
+        # Adicionar dados específicos do formulário se necessário
+        form_data['fPP'] = 'fPP'
+        
+        print("Enviando formulário de busca...")
+        print(f"Campo CPF usado: {cpf_field_name} = {cpf}")
+        
+        # Enviar formulário
+        search_response = session.post(form_url, data=form_data)
+        search_response.raise_for_status()
+        
+        # Analisar resultados
+        result_soup = BeautifulSoup(search_response.text, 'html.parser')
+        
+        # Salvar HTML para debug
+        with open('debug_busca_validada.html', 'w', encoding='utf-8') as f:
+            f.write(search_response.text)
+        
+        print(f"Procurando pelo processo: {PROCESSO_TEXTO}")
+        
+        # Buscar pelo link do processo - método exato da validação
+        processo_url = None
+        
+        # Buscar por todos os links na página
+        all_links = result_soup.find_all('a', href=True)
+        
+        for link in all_links:
+            link_text = link.get_text(strip=True)
+            href = link.get('href')
+            
+            # Verificar se o link contém o texto exato do processo
+            if PROCESSO_TEXTO in link_text:
+                if href.startswith('/'):
+                    processo_url = f"https://pje2g.trf1.jus.br{href}"
+                else:
+                    processo_url = href
+                print(f"Processo encontrado! URL: {processo_url}")
+                print(f"Texto do link: {link_text}")
+                break
+            
+            # Verificar também pelo número do processo
+            elif PROCESSO_NUMERO in link_text:
+                if href.startswith('/'):
+                    processo_url = f"https://pje2g.trf1.jus.br{href}"
+                else:
+                    processo_url = href
+                print(f"Processo encontrado pelo número! URL: {processo_url}")
+                print(f"Texto do link: {link_text}")
+                break
+        
+        if not processo_url:
+            print("Processo não encontrado nos resultados")
+            print("Links encontrados na página:")
+            for i, link in enumerate(all_links[:10]):
+                text = link.get_text(strip=True)
+                if text and len(text) > 5:
+                    print(f"  {i+1}: {text[:100]}")
+            return None
+        
+        return processo_url
+        
+    except Exception as e:
+        print(f"Erro durante busca: {e}")
+        return None
+
+def extrair_movimentos_detalhes(session, processo_url):
+    """
+    Extrai movimentos da página de detalhes
+    """
+    movimentos_list = []
+    try:
+        print(f"Acessando página de detalhes: {processo_url}")
+        
+        response = session.get(processo_url)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Salvar HTML para debug
+        with open('debug_detalhes_validado.html', 'w', encoding='utf-8') as f:
+            f.write(response.text)
+        
+        print("Extraindo movimentos da página de detalhes...")
+        
+        # Buscar por movimentos usando múltiplas estratégias
+        
+        # Estratégia 1: Buscar por texto que contenha datas brasileiras
+        date_pattern = re.compile(r'\d{2}/\d{2}/\d{4}')
+        
+        # Buscar em todos os elementos de texto
+        all_text_elements = soup.find_all(string=True)
+        
+        for text in all_text_elements:
+            text_clean = text.strip()
+            if date_pattern.search(text_clean) and len(text_clean) > 20:
+                # Verificar se parece com um movimento
+                movimento_keywords = ['conclus', 'distribu', 'juntad', 'intimaç', 'decisão', 'sentença', 'despacho', 'petição', 'recurso']
+                if any(palavra in text_clean.lower() for palavra in movimento_keywords):
+                    movimentos_list.append(text_clean)
+                    print(f"Movimento encontrado: {text_clean[:100]}...")
+        
+        # Estratégia 2: Buscar em tabelas
+        tables = soup.find_all('table')
+        for table in tables:
+            rows = table.find_all('tr')
+            for row in rows:
+                cells = row.find_all(['td', 'th'])
+                if len(cells) >= 2:
+                    row_text = ' '.join([cell.get_text(strip=True) for cell in cells])
+                    if date_pattern.search(row_text) and len(row_text) > 20:
+                        movimentos_list.append(row_text)
+                        print(f"Movimento em tabela: {row_text[:100]}...")
+        
+        # Estratégia 3: Buscar por divs específicas
+        divs = soup.find_all('div')
+        for div in divs:
+            text = div.get_text(strip=True)
+            if date_pattern.search(text) and len(text) > 20 and len(text) < 500:
+                movimento_keywords = ['conclus', 'distribu', 'juntad', 'intimaç', 'decisão', 'sentença', 'despacho']
+                if any(palavra in text.lower() for palavra in movimento_keywords):
+                    movimentos_list.append(text)
+                    print(f"Movimento em div: {text[:100]}...")
+        
+        # Remover duplicatas mantendo a ordem
+        movimentos_list = list(dict.fromkeys(movimentos_list))
+        
+        # Se não encontrou movimentos específicos, buscar por qualquer texto com data
+        if not movimentos_list:
+            print("Nenhum movimento específico encontrado, buscando textos com datas...")
+            for text in all_text_elements:
+                text_clean = text.strip()
+                if date_pattern.search(text_clean) and len(text_clean) > 15 and len(text_clean) < 300:
+                    movimentos_list.append(text_clean)
+            
+            # Limitar e remover duplicatas
+            movimentos_list = list(dict.fromkeys(movimentos_list))[:15]
+        
+        print(f"Total de movimentos extraídos: {len(movimentos_list)}")
+        return movimentos_list
+        
+    except Exception as e:
+        print(f"Erro ao extrair movimentos: {e}")
+        return []
+
+def get_current_movs():
+    """
+    Função principal para obter movimentos atuais
+    """
+    session = create_session()
+    
+    try:
+        # Buscar processo usando método validado
+        processo_url = buscar_processo_validado(session, CPF_BUSCA)
+        
+        if not processo_url:
+            print("Erro: Não foi possível encontrar o processo")
+            return []
+        
+        # Extrair movimentos da página de detalhes
+        movimentos = extrair_movimentos_detalhes(session, processo_url)
+        
+        return movimentos
+        
+    except Exception as e:
+        print(f"Erro geral na obtenção de movimentos: {e}")
+        return []
 
 def send_email_yagmail(subject, body):
     """
@@ -42,34 +307,6 @@ def send_email_yagmail(subject, body):
     except Exception as e:
         print(f"Erro ao enviar e-mail: {e}")
         return False
-
-def get_current_movs():
-    """
-    Extrai os movimentos atuais do processo no TRF1
-    """
-    movimentos_list = []
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        html_content = response.text
-    except requests.exceptions.RequestException as e:
-        print(f"Erro ao acessar a URL: {e}")
-        return []
-
-    soup = BeautifulSoup(html_content, "html.parser")
-
-    # Regex para encontrar o padrão de data e hora no início da string
-    date_time_pattern = re.compile(r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2} - ")
-
-    # Buscar por todos os elementos <td> na página
-    all_tds = soup.find_all("td")
-
-    for td in all_tds:
-        text = td.get_text(strip=True)
-        if date_time_pattern.match(text):
-            movimentos_list.append(text)
-    
-    return movimentos_list
 
 def load_previous_movs():
     """
@@ -121,6 +358,8 @@ def generate_email_body(has_update, current_movs):
     
     email_body += status_message
     email_body += "<hr>"
+    email_body += f"<h3>Processo: {PROCESSO_TEXTO}</h3>"
+    email_body += f"<p><strong>CPF consultado:</strong> {CPF_BUSCA}</p>"
     email_body += "<h3>Movimentações do Processo:</h3>"
     
     if current_movs:
@@ -135,7 +374,7 @@ def generate_email_body(has_update, current_movs):
     email_body += "<hr>"
     email_body += f"<p><small>Consulta realizada em: {datetime.now().strftime('%d/%m/%Y às %H:%M:%S')}</small></p>"
     email_body += f"<p><small>Total de movimentações: {len(current_movs)}</small></p>"
-    email_body += f"<p><small>Executado via Railway Cloud</small></p>"
+    email_body += f"<p><small>Método: Busca validada manualmente - versão final</small></p>"
     
     return email_body
 
@@ -144,6 +383,9 @@ def main():
     Função principal do robô de monitoramento
     """
     print(f"Iniciando monitoramento do TRF1 - {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    print(f"CPF de busca: {CPF_BUSCA}")
+    print(f"Processo esperado: {PROCESSO_TEXTO}")
+    print("Versão: FINAL - Validada manualmente")
     
     # Verificar se a App Password está configurada
     if not EMAIL_APP_PASSWORD:
@@ -152,11 +394,30 @@ def main():
         return
     
     # Obter movimentos atuais
-    print("Obtendo movimentos atuais...")
+    print("Iniciando busca com método validado...")
     current_movs = get_current_movs()
     
     if not current_movs:
         print("ERRO: Não foi possível obter os movimentos do processo.")
+        # Enviar e-mail de erro
+        error_subject = f"ERRO - Situação Processo TRF1 - {datetime.now().strftime('%d/%m/%Y')}"
+        error_body = f"""
+        <p style="color: red; font-weight: bold;">ERRO NA CONSULTA DO PROCESSO</p>
+        <p>Não foi possível acessar ou extrair as movimentações do processo.</p>
+        <p><strong>CPF consultado:</strong> {CPF_BUSCA}</p>
+        <p><strong>Processo esperado:</strong> {PROCESSO_TEXTO}</p>
+        <p>Possíveis causas:</p>
+        <ul>
+            <li>Site do TRF1 indisponível</li>
+            <li>Processo não encontrado</li>
+            <li>Mudança na estrutura da página</li>
+            <li>Problema de conectividade</li>
+        </ul>
+        <p><small>Verificação realizada em: {datetime.now().strftime('%d/%m/%Y às %H:%M:%S')}</small></p>
+        <p><small>Versão: FINAL - Validada manualmente</small></p>
+        """
+        
+        send_email_yagmail(error_subject, error_body)
         return
     
     print(f"Encontrados {len(current_movs)} movimentos.")
@@ -192,4 +453,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
