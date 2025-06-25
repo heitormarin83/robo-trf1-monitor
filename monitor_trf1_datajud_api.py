@@ -10,7 +10,7 @@ DATAJUD_API_KEY = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="
 
 # Configurações do processo
 PROCESSO_NUMERO = "1002946-59.2025.4.01.9999"
-PROCESSO_NUMERO_LIMPO = PROCESSO_NUMERO.replace("-", "").replace(".", "")
+PROCESSO_NUMERO_LIMPO = PROCESSO_NUMERO.replace("-", "" ).replace(".", "")
 
 # Configurações de e-mail (usando variáveis de ambiente)
 EMAIL_USER = os.getenv("EMAIL_USER", "heitor.a.marin@gmail.com")
@@ -317,7 +317,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 if __name__ == "__main__":
