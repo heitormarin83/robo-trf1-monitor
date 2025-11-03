@@ -1,8 +1,12 @@
 import requests
 import json
 import os
+import smtplib
+import ssl
+import socket
 from datetime import datetime
-import yagmail
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 # Configurações da API DataJud
 DATAJUD_API_URL = "https://api-publica.datajud.cnj.jus.br/api_publica_trf1/_search"
@@ -10,12 +14,17 @@ DATAJUD_API_KEY = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="
 
 # Configurações do processo
 PROCESSO_NUMERO = "1002946-59.2025.4.01.9999"
-PROCESSO_NUMERO_LIMPO = PROCESSO_NUMERO.replace("-", "" ).replace(".", "")
+PROCESSO_NUMERO_LIMPO = PROCESSO_NUMERO.replace("-", "").replace(".", "")
 
-# Configurações de e-mail (usando variáveis de ambiente)
-EMAIL_USER = os.getenv("EMAIL_USER", "heitor.a.marin@gmail.com")
-EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")
+# Configurações de e-mail (usando variáveis de ambiente padronizadas)
+GMAIL_EMAIL = os.getenv("GMAIL_EMAIL", os.getenv("EMAIL_USER", "heitor.a.marin@gmail.com"))
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", os.getenv("EMAIL_APP_PASSWORD", ""))
 EMAIL_RECIPIENT = os.getenv("EMAIL_RECIPIENT", "heitor.a.marin@gmail.com")
+
+# Configurações SMTP
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_DEBUG = os.getenv("SMTP_DEBUG", "").lower() in ("1", "true", "yes")
+SMTP_FORCE_IPV4 = os.getenv("SMTP_FORCE_IPV4", "true").lower() in ("1", "true", "yes")
 
 # Arquivo para armazenar movimentações anteriores
 MOVIMENTOS_FILE = "movimentos_datajud_previous.json"
@@ -179,65 +188,231 @@ def check_for_updates(current_movs, previous_movs):
     
     return False
 
-def send_email_yagmail(subject, body):
+def send_email_robust(subject, html_body):
     """
-    Envia e-mail usando yagmail
+    Envia e-mail usando SMTP com fallback robusto
+    Baseado no sistema do Insurance News Agent
     """
     try:
-        if not EMAIL_APP_PASSWORD:
-            print("❌ ERRO: App Password do Gmail não configurada!")
+        if not GMAIL_EMAIL or not GMAIL_APP_PASSWORD:
+            print("❌ ERRO: GMAIL_EMAIL e/ou GMAIL_APP_PASSWORD não configurados!")
+            print(f"   GMAIL_EMAIL: {'✓ configurado' if GMAIL_EMAIL else '✗ não configurado'}")
+            print(f"   GMAIL_APP_PASSWORD: {'✓ configurado' if GMAIL_APP_PASSWORD else '✗ não configurado'}")
             return False
         
-        print(f"📧 Enviando e-mail para: {EMAIL_RECIPIENT}")
+        # Preparar lista de destinatários
+        recipients = [r.strip() for r in EMAIL_RECIPIENT.split(",") if r.strip()]
+        if not recipients:
+            print("❌ ERRO: Nenhum destinatário configurado!")
+            return False
         
-        yag = yagmail.SMTP(EMAIL_USER, EMAIL_APP_PASSWORD)
-        yag.send(
-            to=EMAIL_RECIPIENT,
-            subject=subject,
-            contents=body
-        )
+        print(f"📧 Preparando envio de e-mail...")
+        print(f"   De: {GMAIL_EMAIL}")
+        print(f"   Para: {', '.join(recipients)}")
+        print(f"   Assunto: {subject}")
         
-        print(f"✅ E-mail enviado com sucesso!")
-        return True
+        # Criar mensagem MIME
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"Robô TRF1 Monitor <{GMAIL_EMAIL}>"
+        msg["To"] = ", ".join(recipients)
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
         
+        # Configuração de debug
+        debug_smtp = SMTP_DEBUG
+        force_ipv4 = SMTP_FORCE_IPV4
+        
+        # Monkey-patch temporário para forçar IPv4 (contorna ambientes sem IPv6)
+        orig_getaddrinfo = socket.getaddrinfo
+        def only_v4(host, port, family=0, type=0, proto=0, flags=0):
+            res = orig_getaddrinfo(host, port, family, type, proto, flags)
+            v4 = [r for r in res if r[0] == socket.AF_INET]
+            return v4 or res
+        
+        try:
+            if force_ipv4:
+                print("🔧 Forçando uso de IPv4 para conexão SMTP")
+                socket.getaddrinfo = only_v4
+            
+            # Tentativa 1: Porta 587 com STARTTLS
+            try:
+                print(f"📡 Tentando conexão via {SMTP_SERVER}:587 (STARTTLS)...")
+                context = ssl.create_default_context()
+                with smtplib.SMTP(SMTP_SERVER, 587, timeout=30) as smtp:
+                    if debug_smtp:
+                        smtp.set_debuglevel(1)
+                    smtp.ehlo()
+                    smtp.starttls(context=context)
+                    smtp.ehlo()
+                    smtp.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
+                    smtp.sendmail(GMAIL_EMAIL, recipients, msg.as_string())
+                print(f"✅ E-mail enviado com sucesso via {SMTP_SERVER}:587 (STARTTLS)")
+                return True
+                
+            except smtplib.SMTPAuthenticationError as e:
+                print(f"❌ Erro de autenticação SMTP (porta 587): {e}")
+                print("   Verifique se o GMAIL_APP_PASSWORD está correto")
+                print("   Gere uma senha de app em: https://myaccount.google.com/apppasswords")
+                return False
+                
+            except Exception as e:
+                print(f"⚠️ Falha na porta 587/STARTTLS: {e}")
+                print(f"🔄 Tentando fallback para porta 465/SSL...")
+            
+            # Tentativa 2: Porta 465 com SSL direto
+            try:
+                print(f"📡 Tentando conexão via {SMTP_SERVER}:465 (SSL)...")
+                context = ssl.create_default_context()
+                with smtplib.SMTP_SSL(SMTP_SERVER, 465, context=context, timeout=30) as smtp:
+                    if debug_smtp:
+                        smtp.set_debuglevel(1)
+                    smtp.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
+                    smtp.sendmail(GMAIL_EMAIL, recipients, msg.as_string())
+                print(f"✅ E-mail enviado com sucesso via {SMTP_SERVER}:465 (SSL)")
+                return True
+                
+            except smtplib.SMTPAuthenticationError as e:
+                print(f"❌ Erro de autenticação SMTP (porta 465): {e}")
+                print("   Verifique se o GMAIL_APP_PASSWORD está correto")
+                return False
+                
+            except Exception as e:
+                print(f"❌ Falha na porta 465/SSL: {e}")
+                print("❌ Todas as tentativas de envio falharam")
+                return False
+        
+        finally:
+            if force_ipv4:
+                socket.getaddrinfo = orig_getaddrinfo
+                
     except Exception as e:
-        print(f"❌ Erro ao enviar e-mail: {e}")
+        print(f"❌ Erro inesperado ao enviar e-mail: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def generate_email_body(has_update, movimentacoes):
     """
-    Gera corpo do e-mail em HTML
+    Gera corpo do e-mail em HTML com formatação aprimorada
     """
     if has_update:
-        status_message = '<p style="color: red; font-weight: bold; font-size: 18px;">🔴 PROCESSO ATUALIZADO</p>'
+        status_message = '<p style="color: #d32f2f; font-weight: bold; font-size: 20px; text-align: center; background-color: #ffebee; padding: 15px; border-radius: 5px; margin: 20px 0;">🔴 PROCESSO ATUALIZADO</p>'
     else:
-        status_message = '<p style="color: green; font-weight: bold; font-size: 18px;">🟢 PROCESSO SEM MOVIMENTAÇÃO</p>'
+        status_message = '<p style="color: #388e3c; font-weight: bold; font-size: 20px; text-align: center; background-color: #e8f5e9; padding: 15px; border-radius: 5px; margin: 20px 0;">🟢 PROCESSO SEM MOVIMENTAÇÃO</p>'
     
     email_body = f"""
-    <html>
-    <body>
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Situação Processo TRF1</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        .container {{
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        h2 {{
+            color: #1976d2;
+            border-bottom: 3px solid #1976d2;
+            padding-bottom: 10px;
+            margin-top: 30px;
+        }}
+        h3 {{
+            color: #424242;
+            margin-top: 25px;
+        }}
+        .info-box {{
+            background-color: #e3f2fd;
+            padding: 15px;
+            border-left: 4px solid #1976d2;
+            margin: 15px 0;
+            border-radius: 4px;
+        }}
+        .info-box p {{
+            margin: 8px 0;
+        }}
+        .movimentacoes {{
+            background-color: #fafafa;
+            padding: 20px;
+            border-radius: 4px;
+            margin: 15px 0;
+        }}
+        .movimentacoes ol {{
+            line-height: 1.8;
+            padding-left: 25px;
+        }}
+        .movimentacoes li {{
+            margin-bottom: 12px;
+            padding: 8px;
+            background-color: white;
+            border-radius: 4px;
+            border-left: 3px solid #e0e0e0;
+        }}
+        .movimentacoes li.recent {{
+            font-weight: bold;
+            border-left-color: #ff9800;
+            background-color: #fff3e0;
+        }}
+        .footer {{
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 2px solid #e0e0e0;
+            font-size: 0.9em;
+            color: #757575;
+        }}
+        .footer p {{
+            margin: 5px 0;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
         {status_message}
-        <hr>
-        <h3>📋 Processo TRF1 - 2ª Instância</h3>
-        <p><strong>🆔 Número:</strong> {PROCESSO_NUMERO}</p>
-        <p><strong>🔍 Fonte:</strong> API Oficial DataJud/CNJ</p>
         
-        <h3>📄 Movimentações do Processo:</h3>
+        <h2>📋 Processo TRF1 - 2ª Instância</h2>
         
-        {f'<p><strong>📊 Total de movimentações:</strong> {len(movimentacoes)}</p>' if movimentacoes else ''}
+        <div class="info-box">
+            <p><strong>🆔 Número do Processo:</strong> {PROCESSO_NUMERO}</p>
+            <p><strong>🔍 Fonte de Dados:</strong> API Oficial DataJud/CNJ</p>
+            <p><strong>🕐 Consulta Realizada em:</strong> {datetime.now().strftime('%d/%m/%Y às %H:%M:%S')}</p>
+        </div>
         
-        {'<ol style="line-height: 1.8; padding-left: 20px;">' if movimentacoes else '<p><em>❌ Nenhuma movimentação encontrada.</em></p>'}
+        <h3>📄 Movimentações do Processo</h3>
         
-        {''.join([f'<li style="margin-bottom: 10px; {"font-weight: bold;" if i < 3 else ""}">{mov}</li>' for i, mov in enumerate(movimentacoes)])}
+        <div class="movimentacoes">
+            {f'<p style="margin-bottom: 15px;"><strong>📊 Total de movimentações:</strong> {len(movimentacoes)}</p>' if movimentacoes else ''}
+            
+            {'<ol>' if movimentacoes else '<p style="text-align: center; color: #757575; font-style: italic; padding: 20px;">❌ Nenhuma movimentação encontrada.</p>'}
+            
+            {''.join([f'<li class="{"recent" if i < 3 else ""}">{mov}</li>' for i, mov in enumerate(movimentacoes)])}
+            
+            {'</ol>' if movimentacoes else ''}
+        </div>
         
-        {'</ol>' if movimentacoes else ''}
-        
-        <hr>
-        <p><small>🕐 Consulta realizada em: {datetime.now().strftime('%d/%m/%Y às %H:%M:%S')}</small></p>
-        <p><small>🔗 Método: API Oficial DataJud/CNJ</small></p>
-        <p><small>🤖 Robô TRF1 v3.0 - DataJud API</small></p>
-    </body>
-    </html>
+        <div class="footer">
+            <p><strong>🤖 Robô TRF1 Monitor v3.1</strong></p>
+            <p>🔗 Método: API Oficial DataJud/CNJ</p>
+            <p>🌐 Endpoint: {DATAJUD_API_URL}</p>
+            <p style="margin-top: 15px; font-size: 0.85em;">
+                Este é um e-mail automático gerado pelo sistema de monitoramento de processos TRF1.
+                As informações são obtidas diretamente da API oficial do DataJud/CNJ.
+            </p>
+        </div>
+    </div>
+</body>
+</html>
     """
     
     return email_body
@@ -247,7 +422,7 @@ def main():
     Função principal do robô
     """
     print("=" * 80)
-    print("🤖 ROBÔ TRF1 - MONITORAMENTO VIA API DATAJUD v3.0")
+    print("🤖 ROBÔ TRF1 - MONITORAMENTO VIA API DATAJUD v3.1")
     print("=" * 80)
     print(f"🕐 Iniciando monitoramento: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
     print(f"📋 Processo: {PROCESSO_NUMERO}")
@@ -264,15 +439,29 @@ def main():
         # Enviar e-mail de erro
         error_subject = f"❌ ERRO API - Situação Processo TRF1 - {datetime.now().strftime('%d/%m/%Y')}"
         error_body = f"""
-        <p style="color: red; font-weight: bold;">❌ ERRO NA CONSULTA DA API DATAJUD</p>
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; padding: 20px; }}
+        .error-box {{ background-color: #ffebee; padding: 20px; border-left: 4px solid #d32f2f; border-radius: 4px; }}
+    </style>
+</head>
+<body>
+    <div class="error-box">
+        <p style="color: #d32f2f; font-weight: bold; font-size: 18px;">❌ ERRO NA CONSULTA DA API DATAJUD</p>
         <p>Não foi possível acessar a API oficial do DataJud/CNJ.</p>
         <p><strong>📋 Processo:</strong> {PROCESSO_NUMERO}</p>
         <p><strong>🌐 Endpoint:</strong> {DATAJUD_API_URL}</p>
         <p><strong>🕐 Tentativa em:</strong> {datetime.now().strftime('%d/%m/%Y às %H:%M:%S')}</p>
-        <p><small>🤖 Robô TRF1 v3.0 - DataJud API</small></p>
+        <p style="margin-top: 20px; font-size: 0.9em; color: #757575;">🤖 Robô TRF1 Monitor v3.1 - DataJud API</p>
+    </div>
+</body>
+</html>
         """
         
-        send_email_yagmail(error_subject, error_body)
+        send_email_robust(error_subject, error_body)
         print("=" * 80)
         return
     
@@ -302,11 +491,11 @@ def main():
     
     # Gerar e enviar e-mail
     data_consulta = datetime.now().strftime("%d/%m/%Y")
-    email_subject = f"📋 Situação Processo TRF1 - {data_consulta}"
+    email_subject = f"Situação Processo TRF1 - {data_consulta}"
     email_body = generate_email_body(has_update, movimentacoes_atuais)
     
     print("📧 Enviando e-mail...")
-    success = send_email_yagmail(email_subject, email_body)
+    success = send_email_robust(email_subject, email_body)
     
     if success:
         print("✅ Monitoramento concluído com sucesso!")
@@ -317,9 +506,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-if __name__ == "__main__":
-    main()
-
-
